@@ -250,6 +250,7 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        is_per_channel: bool = False,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
@@ -276,6 +277,7 @@ class Fp8Config(QuantizationConfig):
         self.kv_cache_quant_algo = kv_cache_quant_algo
         # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
+        self.is_per_channel = is_per_channel
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
@@ -344,6 +346,7 @@ class Fp8Config(QuantizationConfig):
             config, ["kv_cache_quant_algo"], None
         )
         scale_fmt = cls.get_from_keys_or(config, ["scale_fmt"], None)
+        is_per_channel = cls.get_from_keys_or(config, ["is_per_channel"], False)
         if use_mxfp8:
             # MXFP8 (OCP) spec fixes block size to [1, 32]; ckpt field is metadata only.
             if weight_block_size is not None and weight_block_size != [1, 32]:
@@ -361,6 +364,7 @@ class Fp8Config(QuantizationConfig):
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
             scale_fmt=scale_fmt,
+            is_per_channel=is_per_channel,
         )
 
     def get_quant_method(
@@ -481,6 +485,7 @@ class Fp8LinearMethod(LinearMethodBase):
             self.use_marlin = force_marlin or auto_enable
 
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
+        self.is_per_channel = getattr(self.quant_config, "is_per_channel", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
@@ -633,12 +638,28 @@ class Fp8LinearMethod(LinearMethodBase):
                     scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale", scale)
+                # Check if per-channel quantization is requested
+                is_per_channel = getattr(quant_config, "is_per_channel", False)
+                
+                if is_per_channel:
+                    # Per-channel weight quantization: scale shape [out_features]
+                    from sglang.srt.layers.parameter import ChannelQuantScaleParameter
+                    
+                    scale = ChannelQuantScaleParameter(
+                        data=torch.empty(output_size_per_partition, dtype=torch.float32),
+                        output_dim=0,
+                        weight_loader=weight_loader,
+                    )
+                    scale[:] = torch.finfo(torch.float32).min
+                    layer.register_parameter("weight_scale_inv", scale)
+                else:
+                    # Per-tensor weight quantization
+                    scale = PerTensorScaleParameter(
+                        data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                        weight_loader=weight_loader,
+                    )
+                    scale[:] = torch.finfo(torch.float32).min
+                    layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
             if (
@@ -919,6 +940,16 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
+        elif self.is_per_channel:
+            # The checkpoint stores [out, in] because the loader fuses wq_a+wkv on
+            # dim 0 and shards output_dim=0; apply_fp8_linear needs [K, N]. Keep the
+            # transposed view uncontiguous -- that is the column-major layout
+            # torch._scaled_mm wants for mat2.
+            layer.weight = Parameter(layer.weight.data.t(), requires_grad=False)
+            layer.weight_scale_inv = Parameter(
+                layer.weight_scale_inv.data, requires_grad=False
+            )
+            layer.input_scale = None
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -1125,10 +1156,13 @@ class Fp8LinearMethod(LinearMethodBase):
             # orig_dtype (when present) sets the GEMM output dtype.
             qx, x_scale = x[0], x[1]
             out_dtype = x[2] if len(x) > 2 else None
+            weight_scale = (
+                layer.weight_scale_inv if self.is_per_channel else layer.weight_scale
+            )
             return apply_fp8_linear(
                 input=qx,
                 weight=layer.weight,
-                weight_scale=layer.weight_scale,
+                weight_scale=weight_scale,
                 input_scale=x_scale,
                 bias=bias,
                 cutlass_fp8_supported=self.cutlass_fp8_supported,
@@ -1136,10 +1170,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 pre_quant_output_dtype=out_dtype,
             )
 
+        weight_scale = (
+            layer.weight_scale_inv if self.is_per_channel else layer.weight_scale
+        )
         return apply_fp8_linear(
             input=x,
             weight=layer.weight,
-            weight_scale=layer.weight_scale,
+            weight_scale=weight_scale,
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
@@ -1163,6 +1200,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: Fp8Config):
         self.quant_config = quant_config
         self.use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
+        self.is_per_channel = getattr(self.quant_config, "is_per_channel", False)
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
@@ -1414,6 +1452,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             assert quant_config.activation_scheme == "dynamic"
 
+        elif getattr(quant_config, "is_per_channel", False):
+            # Per-channel MoE FP8: one scale per output channel per expert.
+            # w13: [num_experts, w13_num_shards * intermediate_size_per_partition]
+            # w2:  [num_experts, hidden_size]
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    w13_num_shards * intermediate_size_per_partition,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(num_experts, hidden_size, dtype=torch.float32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+
+            assert quant_config.activation_scheme == "dynamic"
+
         else:
             # One scale per w13 shard; a gated layer combines its two into a
             # single scale after weight loading.
@@ -1446,10 +1505,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
+        is_per_channel = getattr(quant_config, "is_per_channel", False)
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
             if block_quant
-            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+            else (
+                {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+                if is_per_channel
+                else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+            )
         )
 
         # If loading fp8 checkpoint, pass the weight loaders.
@@ -2134,6 +2198,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
 
+        elif self.is_per_channel:
+            # Per-channel FP8 MoE: scales already loaded as [num_experts, out_features]
+            # Triton MoE kernel expects weights as [num_experts, out, in], so no transpose needed
+            layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
+            layer.w13_weight_scale_inv = Parameter(
+                layer.w13_weight_scale_inv.data, requires_grad=False
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                layer.w2_weight_scale_inv.data, requires_grad=False
+            )
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
+
         # If checkpoint is fp16 or bfloat16, quantize in place.
         elif not self.quant_config.is_checkpoint_fp8_serialized:
             # If ROCm, fp8_dtype will be float8_e4m3fnuz (MI300x HW)
@@ -2481,13 +2559,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             b2=getattr(layer, "w2_weight_bias", None),
             use_mxfp8=use_rocm_mxfp8,
             use_fp8_w8a8=not use_rocm_mxfp8,
+            # Without this the kernel silently takes its tensor-wise branch and
+            # reads the [num_experts, N] scale as num_experts scalars.
+            per_channel_quant=self.is_per_channel,
             w13_scale=(
                 layer.w13_weight_scale_inv
-                if self.block_quant
+                if (self.block_quant or self.is_per_channel)
                 else layer.w13_weight_scale
             ),
             w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
+                layer.w2_weight_scale_inv
+                if (self.block_quant or self.is_per_channel)
+                else layer.w2_weight_scale
             ),
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,

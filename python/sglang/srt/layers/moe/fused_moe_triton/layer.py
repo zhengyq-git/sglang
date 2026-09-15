@@ -673,8 +673,17 @@ class FusedMoE(torch.nn.Module):
         # for per channel weight quantization
         if shard_id == "w2":
             loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
+            # Channelwise scales are saved as [out, 1] due to keepdim=True in
+            # the quantizer; squeeze the trailing singleton so it matches the
+            # 1D expert_data slice.
+            if loaded_weight.dim() == expert_data.dim() + 1 and loaded_weight.shape[-1] == 1:
+                loaded_weight = loaded_weight.squeeze(-1)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):
+            # Squeeze trailing singleton for w13 as well so downstream narrow
+            # sees a 1D tensor matching expert_data along the output dim.
+            if loaded_weight.dim() == expert_data.dim() + 1 and loaded_weight.shape[-1] == 1:
+                loaded_weight = loaded_weight.squeeze(-1)
             self._load_w13(
                 shard_id=shard_id,
                 shard_dim=shard_dim,

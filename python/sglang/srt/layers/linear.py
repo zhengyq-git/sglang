@@ -275,6 +275,15 @@ class ReplicatedLinear(LinearBase):
         if is_gguf_weight and isinstance(param, UninitializedParameter):
             param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
 
+        # Channelwise scales in checkpoint may be [out, 1] due to keepdim=True;
+        # squeeze the trailing singleton before loading.
+        if (
+            loaded_weight.ndim == param.ndim + 1
+            and loaded_weight.shape[-1] == 1
+            and loaded_weight.shape[:-1] == param.shape
+        ):
+            loaded_weight = loaded_weight.squeeze(-1)
+
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
             if param.size() != loaded_weight.size() and param.size(0) == 1:

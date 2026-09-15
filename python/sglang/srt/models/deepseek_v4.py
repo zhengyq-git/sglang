@@ -772,6 +772,12 @@ class MqaAttentionBase(nn.Module):
             if self.dsa_enable_prefill_cp:
                 self.cp_size = get_parallel().attn_cp_size
                 attn_tp_rank, attn_tp_size = 0, 1
+
+        # Auto-downgrade attn_tp_size when o_groups < attn_tp_size to avoid division by zero
+        # This happens with small o_groups (e.g., 8) and large TP (e.g., 16)
+        if config.o_groups < attn_tp_size:
+            attn_tp_rank, attn_tp_size = 0, 1
+
         self.attn_tp_rank: int = attn_tp_rank
         self.attn_tp_size: int = attn_tp_size
 
