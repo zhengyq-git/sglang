@@ -4890,31 +4890,39 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif (
                                 COMPRESSOR_PART in name
                                 and ".wkv_gate." not in name
-                                and (name.rsplit(".", 2)[0] + ".wkv_gate.weight")
+                                and (
+                                    name.endswith(".wkv.weight")
+                                    or name.endswith(".wgate.weight")
+                                    or name.endswith(".wkv.weight_scale")
+                                    or name.endswith(".wgate.weight_scale")
+                                )
+                                and (name.rsplit(".", 2)[0] + ".wkv_gate." + name.rsplit(".", 1)[-1])
                                 in params_dict
                             ):
                                 # Concatenate checkpoint wkv/wgate whenever the target owns wkv_gate;
                                 # modules with split projections use per-parameter loading.
-                                is_kv = name.endswith(".wkv.weight")
-                                is_wgate = name.endswith(".wgate.weight")
+                                suffix = name.rsplit(".", 1)[-1]  # "weight" or "weight_scale"
+                                is_kv = ".wkv." in name
+                                is_wgate = ".wgate." in name
                                 assert is_kv != is_wgate
                                 key = name.rsplit(".", 2)[0]
                                 assert key.endswith(".compressor")
-                                if key not in cache_compressor_weight:
-                                    cache_compressor_weight[key] = (
+                                cache_key = (key, suffix)
+                                if cache_key not in cache_compressor_weight:
+                                    cache_compressor_weight[cache_key] = (
                                         is_kv,
                                         _clone_if_runai_streamed_tensor(loaded_weight),
                                     )
                                 else:
-                                    assert key in cache_compressor_weight
+                                    assert cache_key in cache_compressor_weight
                                     cached_is_kv, cached_weight = (
-                                        cache_compressor_weight[key]
+                                        cache_compressor_weight[cache_key]
                                     )
                                     assert cached_is_kv != is_kv
                                     kv = loaded_weight if is_kv else cached_weight
                                     wgate = loaded_weight if is_wgate else cached_weight
                                     fused_weight = torch.cat([kv, wgate], dim=0)
-                                    param_name = key + ".wkv_gate.weight"
+                                    param_name = key + ".wkv_gate." + suffix
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
@@ -4925,7 +4933,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func_args=(param, fused_weight),
                                     )
                                     loaded_params.add(param_name)
-                                    cache_compressor_weight.pop(key)
+                                    cache_compressor_weight.pop(cache_key)
                             elif (
                                 fuse_wqa_wkv
                                 and ".compressor." not in name
@@ -4935,6 +4943,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     or name.endswith(".wq_a.weight_scale_inv")
                                     or name.endswith(".wkv.weight")
                                     or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
                                     or name.endswith(".wq_a.qweight_type")
