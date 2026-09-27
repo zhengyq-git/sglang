@@ -44,6 +44,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
+    CompressedTensorsW4A8Int8,
     CompressedTensorsW4AFP8MoE,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
@@ -443,6 +444,38 @@ class CompressedTensorsConfig(QuantizationConfig):
             and is_dynamic
         )
 
+    def _is_w4a8_int8(
+        self, weight_quant: Optional[BaseModel], input_quant: Optional[BaseModel]
+    ) -> bool:
+        """Detect W4A8: packed INT4 static symmetric weights + INT8 dynamic
+        activations (per-token or per-tensor).
+
+        Unlike ``_is_dynamic_token_w4a8``, the activation strategy is not
+        restricted to TOKEN so that per-tensor dynamic A8 configs also take the
+        dequantization-based linear path instead of failing outright."""
+        if weight_quant is None or input_quant is None:
+            return False
+
+        is_weight_4_bits = weight_quant.num_bits == 4
+        is_activation_8_bits = input_quant.num_bits == 8
+        is_int_weight = weight_quant.type == QuantizationType.INT
+        weight_strategy = weight_quant.strategy in (
+            QuantizationStrategy.GROUP.value,
+            QuantizationStrategy.CHANNEL.value,
+        )
+        is_static_weight = not weight_quant.dynamic
+        is_dynamic_activation = input_quant.dynamic
+
+        return (
+            is_weight_4_bits
+            and is_activation_8_bits
+            and is_int_weight
+            and weight_strategy
+            and weight_quant.symmetric
+            and is_static_weight
+            and is_dynamic_activation
+        )
+
     def _is_wint4afp8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         """Detect W4AFP8: packed INT4 weights + 8-bit dynamic per-token activations."""
         if weight_quant is None or input_quant is None:
@@ -777,6 +810,22 @@ class CompressedTensorsConfig(QuantizationConfig):
                         is_static_input_scheme=False,
                         input_symmetric=input_quant.symmetric,
                     )
+
+            # W4A8 (INT4 static symmetric weights + INT8 dynamic activations).
+            # No fused dense W4A8 kernel is needed here: the INT4 weights are
+            # dequantized to the compute dtype and the activations keep a real A8
+            # step through the per-token int8 quantizer, so the GEMM runs on the
+            # generic path. This is what makes W4A8 usable on platforms without
+            # a CUTLASS W4A8 dense kernel (e.g. Hygon DCU / HIP).
+            if self._is_w4a8_int8(weight_quant, input_quant):
+                logger.info_once("Using CompressedTensorsW4A8Int8 (dequant fallback)")
+                return CompressedTensorsW4A8Int8(
+                    strategy=weight_quant.strategy,
+                    group_size=weight_quant.group_size,
+                    symmetric=weight_quant.symmetric,
+                    activation_strategy=input_quant.strategy,
+                    params_dtype=torch.bfloat16,
+                )
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
